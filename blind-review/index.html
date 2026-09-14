@@ -19,19 +19,18 @@
   button{border:0;border-radius:6px;background:var(--accent);color:#fff;padding:8px 14px;font-weight:700;cursor:pointer;}
   button.sec{background:var(--accent2);}
   button.ghost{background:#eee;color:var(--ink);border:1px solid var(--line);}
-  button:disabled{opacity:.45;cursor:not-allowed;}
+  button:disabled{opacity:.5;cursor:not-allowed;}
   main{padding:20px 22px;display:grid;grid-template-columns:340px 1fr;gap:18px;align-items:start;}
   .panel,.card{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:16px;}
   .panel{position:sticky;top:18px;}
   h2{font-size:16px;margin:0 0 12px;}
-  h3{font-size:15px;margin:0 0 8px;}
   label{display:block;margin:9px 0 4px;color:var(--muted);font-size:12px;}
   .row{display:flex;gap:8px;align-items:center;}
   .list{display:flex;flex-direction:column;gap:12px;}
   .card{cursor:pointer;}
   .card.active{outline:2px solid var(--accent);}
   .pill{display:inline-block;border-radius:999px;padding:2px 10px;font-size:12px;border:1px solid var(--line);color:var(--muted);}
-  .st-pending{color:var(--muted);} .st-reading{color:var(--accent2);}
+  .st-reading{color:var(--accent2);}
   .st-consensus{color:var(--ok);} .st-adjudicating{color:var(--warn);}
   .st-adjudicated{color:var(--amber);} .st-published{color:var(--ok);background:#e8f2e8;}
   .meta{color:var(--muted);font-size:12px;line-height:1.7;}
@@ -42,7 +41,6 @@
   .tabs{display:flex;gap:6px;margin-bottom:14px;flex-wrap:wrap;}
   .tabs button{background:#e2e7dd;color:var(--ink);}
   .tabs button.on{background:var(--accent);color:#fff;}
-  .detail{display:none;} .detail.on{display:block;}
   .reading{border:1px solid var(--line);border-radius:8px;padding:10px;margin:8px 0;background:#fafcf8;}
   .reading h4{margin:0 0 6px;font-size:13px;}
   table{border-collapse:collapse;width:100%;font-size:13px;}
@@ -55,6 +53,7 @@
   .tag-new{color:var(--ok);font-size:11px;border:1px solid var(--ok);border-radius:4px;padding:0 5px;}
   .muted{color:var(--muted);}
   .grow{flex:1;}
+  .badge{font-size:11px;border:1px solid var(--accent2);color:var(--accent2);border-radius:4px;padding:0 6px;}
   @media(max-width:900px){main{grid-template-columns:1fr;}.panel{position:static;}}
 </style>
 </head>
@@ -64,65 +63,97 @@
     <h1>薄片双人盲评系统</h1>
     <div class="sub">批量编码 · 双人独立读片 · 分歧第三人裁决 · 版本留存 · 整批发布</div>
   </div>
-  <div class="login">
-    <label style="margin:0">角色</label>
-    <select id="role">
-      <option value="host">主持人</option>
-      <option value="reader">读片人</option>
-      <option value="adjudicator">第三人裁决人</option>
-    </select>
-    <label style="margin:0">姓名</label>
-    <input id="name" placeholder="真实姓名" style="width:130px">
-    <button id="enterBtn" class="sec">进入工作台</button>
-  </div>
+  <div class="login" id="loginBox"></div>
 </header>
 
-<main>
-  <!-- 左：操作/列表 -->
+<main id="app" hidden>
   <section class="panel" id="left"></section>
-  <!-- 右：明细 -->
-  <section class="panel" id="right"><div class="muted">请先选择角色并输入姓名进入工作台。</div></section>
+  <section class="panel" id="right"><div class="muted">从左侧选择一项。</div></section>
 </main>
 
 <script>
 "use strict";
 const $ = s => document.querySelector(s);
 const esc = s => String(s ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"}[c]));
-const STATUS_CN = {pending:"待读片",reading:"读片中（已交1人）",consensus:"已达成共识",adjudicating:"分歧·待第三人裁决",adjudicated:"第三人已裁决",published:"已发布"};
-let me = {role:null,name:null};
-let state = {tab:"work", list:[], detail:null, batchCode:"", batches:[]};
+const STATUS_CN = {pending:"待读片",reading:"读片中（已交1人）",consensus:"已达成共识",adjudicating:"分歧/更正后·待第三人裁决",adjudicated:"第三人已裁决",published:"已发布"};
+const ROLE_CN = {host:"主持人",reader:"读片人",adjudicator:"第三人裁决人"};
 
-function uuid(){ return (crypto.randomUUID ? crypto.randomUUID() : "id-"+Math.random().toString(16).slice(2)+Date.now()); }
+let me = null;                 // {name,role,token}
+let state = {tab:"work", detail:null, batchCode:"", batches:[], list:[]};
+let encodeKey = null;          // 编码幂等键：内容变更才换新，双击/重试复用
+let encodeBusy = false;
+
+function uuid(){ return crypto.randomUUID ? crypto.randomUUID() : ("id-"+Math.random().toString(16).slice(2)+Date.now()); }
+
 async function api(method, path, body){
-  const sep = path.includes("?") ? "&" : "?";
-  const url = path + sep + "role=" + encodeURIComponent(me.role) + "&name=" + encodeURIComponent(me.name);
   const opt = {method, headers:{}};
+  if(me?.token) opt.headers["Authorization"] = "Bearer " + me.token;
   if(body !== undefined){ opt.headers["Content-Type"]="application/json"; opt.body=JSON.stringify(body); }
-  const res = await fetch(url, opt);
+  const res = await fetch(path, opt);
   const data = await res.json().catch(()=>({}));
+  if(res.status===401 && (data.error==="invalid_token" || data.error==="token_expired" || data.error==="unauthorized")){
+    doLogout("登录已失效，请重新登录");
+    throw new Error(data.message || "未登录");
+  }
   if(!res.ok){ const e = new Error(data.message || data.error || ("HTTP "+res.status)); e.code=data.error; throw e; }
   return data;
 }
 
 /* ------------------------------------------------------------- 登录 */
-$("#enterBtn").onclick = ()=>{
-  const name = $("#name").value.trim();
-  const role = $("#role").value;
-  if(!name){ alert("请输入姓名"); return; }
-  me = {role,name}; state = {tab:"work",list:[],detail:null,batchCode:"",batches:[]};
-  render(); refresh();
-};
+function renderLoginBox(){
+  const box = $("#loginBox");
+  if(!me){
+    box.innerHTML = `
+      <label style="margin:0">账号</label><input id="liName" placeholder="姓名" style="width:110px" list="accounts">
+      <datalist id="accounts">
+        <option value="贺主持"><option value="卞主持"><option value="张工"><option value="李工">
+        <option value="王二"><option value="赵裁"><option value="钱裁">
+      </datalist>
+      <label style="margin:0">密码</label><input id="liPass" type="password" style="width:110px">
+      <button id="liBtn" class="sec">登录</button>
+      <span id="liMsg" class="meta"></span>`;
+    const submit = async ()=>{
+      const name=$("#liName").value.trim(), password=$("#liPass").value;
+      if(!name||!password){ $("#liMsg").textContent="请输入账号和密码"; return; }
+      $("#liBtn").disabled=true;
+      try{
+        const r = await api("POST","/api/auth/login",{name,password});
+        me = {name:r.name, role:r.role, token:r.token};
+        sessionStorage.setItem("blind_auth", JSON.stringify(me));
+        boot();
+      }catch(e){ $("#liMsg").textContent=e.message; $("#liBtn").disabled=false; }
+    };
+    $("#liBtn").onclick=submit;
+    $("#liPass").onkeydown=e=>{ if(e.key==="Enter") submit(); };
+    return;
+  }
+  box.innerHTML = `<span class="badge">${ROLE_CN[me.role]}</span><b>${esc(me.name)}</b>
+    <button class="ghost" id="logoutBtn">退出</button>`;
+  $("#logoutBtn").onclick=()=>doLogout();
+}
+function doLogout(msg){
+  me=null; sessionStorage.removeItem("blind_auth");
+  $("#app").hidden=true;
+  renderLoginBox();
+  if(msg) alert(msg);
+}
 
 /* ------------------------------------------------------------- 渲染入口 */
+function boot(){
+  renderLoginBox();
+  if(!me) return;
+  $("#app").hidden=false;
+  state = {tab:"work", detail:null, batchCode:"", batches:[], list:[]};
+  render(); refresh();
+}
 function render(){
-  const L = $("#left"), R = $("#right");
-  if(!me.name){ L.innerHTML=""; return; }
+  if(!me) return;
+  const L=$("#left"), R=$("#right");
   if(me.role==="host") renderHost(L);
   else if(me.role==="reader") renderReader(L);
   else renderAdjudicator(L);
   renderDetail(R);
 }
-
 function tabsHtml(tabs){
   return `<div class="tabs">${tabs.map(t=>`<button data-tab="${t.k}" class="${state.tab===t.k?'on':''}">${t.label}</button>`).join("")}</div>`;
 }
@@ -133,39 +164,39 @@ function bindTabs(){
 /* ============================================================= 主持人 */
 function renderHost(L){
   L.innerHTML = tabsHtml([{k:"work",label:"批次/裁决/发布"},{k:"encode",label:"批量编码"}]) + `
-    <div class="detail ${state.tab==='work'?'on':''}" id="hostWork">
+    <div class="detail ${state.tab==='work'?'on':''}">
       <h2>我的批次</h2>
       <div class="row"><input id="batchInput" placeholder="输入批次号 如 B0001" value="${esc(state.batchCode)}" class="grow"><button id="loadBatch">查看</button></div>
       <div class="list" id="batchChips" style="margin-top:10px"></div>
     </div>
-    <div class="detail ${state.tab==='encode'?'on':''}" id="hostEncode">
+    <div class="detail ${state.tab==='encode'?'on':''}">
       <h2>批量编码并指派两名读片人</h2>
       <div id="encMsg"></div>
       <label>项目 / 批次说明</label><input id="project" placeholder="如 东岭铜矿 ZK-17 薄片批">
       <div class="row"><div class="grow"><label>默认读片人 A</label><input id="ra" placeholder="张工"></div>
         <div class="grow"><label>默认读片人 B</label><input id="rb" placeholder="李工"></div></div>
       <label>样本真实身份清单（每行一个；盲评期间对读片人隐藏）</label>
-      <textarea id="identities" style="min-height:150px" placeholder="ZK-17 / 128.4m / 花岗闪长岩&#10;ZK-17 / 130.1m / 矿化带&#10;ZK-17 / 131.0m / 石英脉"></textarea>
-      <div class="meta">每行生成一个连续盲码（如 B0001-S001）。可在某行用“身份 | 读片人A | 读片人B”为单个样本另指两人（仍须不同）。</div>
+      <textarea id="identities" style="min-height:150px" placeholder="ZK-17 / 128.4m / 花岗闪长岩"></textarea>
+      <div class="meta">每行生成连续盲码（如 B0001-S001）。可用“身份 | 读片人A | 读片人B”为单样另指两人（仍须不同）。双击提交只建一批。</div>
       <div style="margin-top:10px"><button id="doEncode">批量编码</button></div>
     </div>`;
   bindTabs();
-  $("#loadBatch").onclick = async ()=>{ state.batchCode=$("#batchInput").value.trim(); await loadBatch(); };
-  $("#doEncode").onclick = doEncode;
+  $("#loadBatch").onclick=async()=>{state.batchCode=$("#batchInput").value.trim();await loadBatch();};
+  // 内容一旦改动即作废旧键（下一次点击生成新键）；双击之间无改动 => 同键 => 只建一批
+  ["project","ra","rb","identities"].forEach(id=>$("#"+id).addEventListener("input",()=>{encodeKey=null;}));
+  $("#doEncode").onclick=doEncode;
   renderBatchChips();
 }
 async function renderBatchChips(){
-  try{
-    const wl = await api("GET","/api/me/worklist");
-    state.batches = wl.batches||[];
-  }catch(e){ state.batches=[]; }
+  try{ const wl=await api("GET","/api/me/worklist"); state.batches=wl.batches||[]; }catch(e){ state.batches=[]; }
   const el=$("#batchChips"); if(!el) return;
-  el.innerHTML = state.batches.length ? state.batches.map(c=>
-    `<button class="ghost" data-bc="${esc(c)}" style="margin:3px">${esc(c)}</button>`).join("")
+  el.innerHTML = state.batches.length
+    ? state.batches.map(c=>`<button class="ghost" data-bc="${esc(c)}" style="margin:3px">${esc(c)}</button>`).join("")
     : `<div class="muted">暂无批次。到“批量编码”创建。</div>`;
   el.querySelectorAll("[data-bc]").forEach(b=>b.onclick=async()=>{state.batchCode=b.dataset.bc;await loadBatch();});
 }
 async function doEncode(){
+  if(encodeBusy) return;                 // 双击/连点：在途直接忽略
   const msg=$("#encMsg"); msg.innerHTML="";
   const project=$("#project").value.trim();
   const ra=$("#ra").value.trim(), rb=$("#rb").value.trim();
@@ -175,14 +206,17 @@ async function doEncode(){
   if(!lines.length){ msg.innerHTML=errHtml("请至少录入一个样本身份"); return; }
   const samples=lines.map(line=>{
     const parts=line.split("|").map(x=>x.trim());
-    if(parts.length>=3) return {identity:parts[0],reader_a:parts[1],reader_b:parts[2]};
-    return {identity:line};
+    return parts.length>=3 ? {identity:parts[0],reader_a:parts[1],reader_b:parts[2]} : {identity:line};
   });
+  if(!encodeKey) encodeKey=uuid();       // 同内容的连点/网络重试复用此键
+  encodeBusy=true; const btn=$("#doEncode"); btn.disabled=true;
   try{
-    const r=await api("POST","/api/batches",{idempotency_key:uuid(),host:me.name,project,default_reader_a:ra,default_reader_b:rb,samples});
-    msg.innerHTML=okHtml(`已编码批次 ${r.batch_code}，共 ${r.count} 个样本（整批成功或整批回滚）。`);
-    $("#identities").value=""; state.batchCode=r.batch_code; state.tab="work"; render(); await loadBatch();
-  }catch(e){ msg.innerHTML=errHtml(e.message); }
+    const r=await api("POST","/api/batches",{idempotency_key:encodeKey,host:me.name,project,default_reader_a:ra,default_reader_b:rb,samples});
+    msg.innerHTML=okHtml(`已编码批次 ${r.batch_code}，共 ${r.count} 个样本（整批成功或整批回滚；连点只建一批）。`);
+    $("#identities").value=""; encodeKey=null;
+    state.batchCode=r.batch_code; state.tab="work"; render(); await loadBatch();
+  }catch(e){ msg.innerHTML=errHtml(e.message); btn.disabled=false; }
+  finally{ encodeBusy=false; }
 }
 async function loadBatch(){
   try{ state.detail={kind:"batch",data:await api("GET","/api/batches/"+encodeURIComponent(state.batchCode))}; }
@@ -192,23 +226,26 @@ async function loadBatch(){
 
 /* ============================================================= 读片人 */
 function renderReader(L){
-  L.innerHTML = `<h2>我的读片任务（盲态）</h2>
-    <div class="meta">提交前你只能看到盲码与自己的记录，<b>看不到样本真实身份，也看不到对方是否已读、结论如何</b>。</div>
+  L.innerHTML=`<h2>我的读片任务（盲态）</h2>
+    <div class="meta">双方都提交前，你只能看到盲码与<b>自己的</b>记录，看不到样本真实身份，也看不到对方是否已读、结论如何。</div>
     <div class="list" id="rdList" style="margin-top:10px"></div>`;
 }
 async function refreshReaderList(){
-  const wl = await api("GET","/api/me/worklist");
-  state.list = wl.samples||[];
-  const el=$("#rdList");
-  if(!el) return;
-  el.innerHTML = state.list.length ? state.list.map((s,i)=>
-    `<div class="card ${state.detail&&state.detail.code===s.blind_code?'active':''}" data-i="${i}">
-       <div class="row"><span class="blind">${esc(s.blind_code)}</span><span class="pill st-${s.status}">${STATUS_CN[s.status]||s.status}</span></div>
-       <div class="meta">批次 ${esc(s.batch_code)} · ${s.my_reading?("你已提交 v"+s.my_reading.version+"（可更正）"):"尚未提交"}</div>
-     </div>`).join("") : `<div class="muted">当前没有分配给你的待办。</div>`;
+  let wl;
+  try{ wl=await api("GET","/api/me/worklist"); }catch(e){ return; }
+  state.list=wl.samples||[];
+  const el=$("#rdList"); if(!el) return;
+  el.innerHTML = state.list.length ? state.list.map((s,i)=>{
+    const submitted = s.my_version != null;
+    return `<div class="card ${state.detail&&state.detail.code===s.blind_code?'active':''}" data-i="${i}">
+      <div class="row"><span class="blind">${esc(s.blind_code)}</span><span class="pill st-${s.status}">${STATUS_CN[s.status]||s.status}</span></div>
+      <div class="meta">批次 ${esc(s.batch_code)} · 你是读片${(s.my_slot==="a"?"A":"B")} ·
+        <b style="color:${submitted?'var(--ok)':'var(--muted)'}">${submitted?("本人已提交 v"+s.my_version+"（可更正）"):"本人尚未提交"}</b></div>
+    </div>`;
+  }).join("") : `<div class="muted">当前没有分配给你的待办。</div>`;
   el.querySelectorAll("[data-i]").forEach(c=>c.onclick=async()=>{
     const s=state.list[+c.dataset.i];
-    try{ state.detail={kind:"sample",code:s.blind_code,data:await api("GET","/api/samples/"+encodeURIComponent(s.blind_code)),role:"reader"}; }
+    try{ state.detail={kind:"sample",code:s.blind_code,data:await api("GET","/api/samples/"+encodeURIComponent(s.blind_code))}; }
     catch(e){ state.detail={kind:"error",message:e.message}; }
     renderDetail($("#right"));
   });
@@ -216,71 +253,70 @@ async function refreshReaderList(){
 
 /* ============================================================= 裁决人 */
 function renderAdjudicator(L){
-  L.innerHTML = `<h2>第三人裁决任务</h2>
+  L.innerHTML=`<h2>第三人裁决任务</h2>
     <div class="meta">你裁决的样本<b>不得是你本人读片的样本</b>；裁决前可见两份匿名结论（A/B），仍看不到样本真实身份。</div>
     <div class="list" id="adjList" style="margin-top:10px"></div>`;
 }
 async function refreshAdjList(){
-  const wl = await api("GET","/api/me/worklist");
-  state.list = wl.samples||[];
-  const el=$("#adjList");
-  if(!el) return;
+  let wl;
+  try{ wl=await api("GET","/api/me/worklist"); }catch(e){ return; }
+  state.list=wl.samples||[];
+  const el=$("#adjList"); if(!el) return;
   el.innerHTML = state.list.length ? state.list.map((s,i)=>
     `<div class="card ${state.detail&&state.detail.code===s.blind_code?'active':''}" data-i="${i}">
        <div class="row"><span class="blind">${esc(s.blind_code)}</span><span class="pill st-adjudicating">待你裁决</span></div>
-       <div class="meta">批次 ${esc(s.batch_code)} · 第 ${s.round} 轮</div>
+       <div class="meta">批次 ${esc(s.batch_code)} · 第 ${s.round} 轮${s.adjudication_required?" · 更正轮":""}</div>
      </div>`).join("") : `<div class="muted">当前没有指派给你的待裁决样本。</div>`;
   el.querySelectorAll("[data-i]").forEach(c=>c.onclick=async()=>{
     const s=state.list[+c.dataset.i];
-    try{ state.detail={kind:"sample",code:s.blind_code,data:await api("GET","/api/samples/"+encodeURIComponent(s.blind_code)),role:"adjudicator"}; }
+    try{ state.detail={kind:"sample",code:s.blind_code,data:await api("GET","/api/samples/"+encodeURIComponent(s.blind_code))}; }
     catch(e){ state.detail={kind:"error",message:e.message}; }
     renderDetail($("#right"));
   });
 }
 
-/* ============================================================= 右侧明细 */
+/* ============================================================= 明细 */
 function renderDetail(R){
-  if(!me.name){ return; }
+  if(!me) return;
   const d=state.detail;
   if(!d){ R.innerHTML=`<div class="muted">${me.role==='host'?'查看一个批次以处理裁决与发布。':'从左侧选择一个盲码。'}</div>`; return; }
   if(d.kind==="error"){ R.innerHTML=errHtml(d.message); return; }
   if(d.kind==="batch") renderBatchDetail(R,d.data);
   if(d.kind==="sample") renderSampleDetail(R,d);
 }
-
 function mineralsTable(mins){
   return `<table><tr><th>矿物</th><th>比例(%)</th></tr>${mins.map(m=>`<tr><td>${esc(m.mineral)}</td><td>${m.percent}</td></tr>`).join("")}</table>`;
 }
-function readingBlock(title, r, who){
+function readingBlock(title,r,who){
   if(!r) return `<div class="reading"><h4>${title}</h4><div class="muted">未提交</div></div>`;
   return `<div class="reading"><h4>${title} ${who?`· ${esc(who)}`:""} ${r.version?`v${r.version}`:""}</h4>
-    <div><b>岩性：</b>${esc(r.lithology)}</div>
-    ${mineralsTable(r.minerals)}
+    <div><b>岩性：</b>${esc(r.lithology)}</div>${mineralsTable(r.minerals)}
     <div class="meta" style="margin-top:6px"><b>依据：</b>${esc(r.rationale)}</div></div>`;
 }
 
 /* ---------- 批次明细（主持人） ---------- */
 function renderBatchDetail(R,b){
-  const canPublish = b.samples.every(s=>s.status==="consensus"||s.status==="adjudicated"||s.status==="published");
-  R.innerHTML = `<div class="row" style="margin-bottom:8px">
+  R.innerHTML=`<div class="row" style="margin-bottom:8px">
       <h2 class="grow">批次 ${esc(b.code)}</h2>
       <span class="pill st-${b.status}">${b.status==="published"?"已发布":"进行中"}</span></div>
     <div class="meta">项目：${esc(b.project)} · 主持人：${esc(b.host)} · 样本 ${b.samples.length} 个</div>
     <div id="pubMsg"></div>
     <div style="margin:10px 0">
       <button id="publishBtn" ${b.status==="published"?"disabled":""}>整批发布（揭晓身份与结论）</button>
-      <span class="meta">仅当全部样本为“共识”或“已裁决”时可发布。</span>
+      <span class="meta">仅当全部样本为“共识”或“已裁决”时可发布；更正后必须重新裁决。</span>
     </div>
     <div class="list" id="sampleList"></div>`;
-  $("#publishBtn").onclick=async()=>publishBatch(b.code);
+  $("#publishBtn").onclick=()=>publishBatch(b.code);
   const el=$("#sampleList");
   el.innerHTML=b.samples.map(s=>{
     const needAdj=s.status==="adjudicating";
     return `<div class="card" style="cursor:default">
-      <div class="row"><span class="blind">${esc(s.blind_code)}</span><span class="pill st-${s.status}">${STATUS_CN[s.status]||s.status}</span></div>
+      <div class="row"><span class="blind">${esc(s.blind_code)}</span><span class="pill st-${s.status}">${STATUS_CN[s.status]||s.status}</span>
+        ${s.adjudication_required?'<span class="badge">须重裁</span>':''}</div>
       <div class="meta">真实身份：<b>${esc(s.identity)}</b><br>读片人 A：${esc(s.reader_a)} ｜ 读片人 B：${esc(s.reader_b)} ｜ 第 ${s.round} 轮</div>
       ${needAdj?`<div class="row" style="margin-top:8px">
-         <input class="grow" data-adjname="${esc(s.blind_code)}" placeholder="指派第三人裁决人（不得为上述两人）">
+         <input class="grow" data-adjname="${esc(s.blind_code)}" placeholder="指派第三人裁决人（裁决岗账号，且非上述两人）" list="adjaccounts">
+         <datalist id="adjaccounts"><option value="赵裁"><option value="钱裁"></datalist>
          <button data-assign="${esc(s.blind_code)}">指派裁决</button></div>
          <div class="meta" data-assignmsg="${esc(s.blind_code)}"></div>`:""}
       ${s.adjudication&&!s.adjudication.pending?`<div class="meta">裁决人：${esc(s.adjudication.adjudicator||"")} · 岩性：${esc(s.adjudication.lithology)}</div>`:""}
@@ -299,77 +335,68 @@ function renderBatchDetail(R,b){
   });
   el.querySelectorAll("[data-hist]").forEach(btn=>btn.onclick=async()=>{
     const code=btn.dataset.hist, box=el.querySelector(`[data-histbox="${CSS.escape(code)}"]`);
-    try{ const h=await api("GET",`/api/samples/${encodeURIComponent(code)}/history`); box.innerHTML=historyHtml(h); }
+    try{ box.innerHTML=historyHtml(await api("GET",`/api/samples/${encodeURIComponent(code)}/history`)); }
     catch(e){ box.innerHTML=errHtml(e.message); }
   });
 }
 async function publishBatch(code){
-  const msg=$("#pubMsg");
+  const msg=$("#pubMsg"), btn=$("#publishBtn");
+  btn.disabled=true;
   try{ const r=await api("POST",`/api/batches/${encodeURIComponent(code)}/publish`,{idempotency_key:uuid(),host:me.name});
     msg.innerHTML=okHtml(`已发布 ${r.published} 个样本（整批生效）。`); await loadBatch(); }
-  catch(e){ msg.innerHTML=errHtml(e.message); }
+  catch(e){ msg.innerHTML=errHtml(e.message); btn.disabled=false; }
 }
 
-/* ---------- 样本明细（读片人 / 裁决人） ---------- */
+/* ---------- 样本明细（读片人/裁决人） ---------- */
 function renderSampleDetail(R,d){
-  const s=d.data;
-  const published=s.status==="published";
+  const s=d.data, published=s.status==="published";
   let head=`<div class="row" style="margin-bottom:8px"><h2 class="grow blind">${esc(s.blind_code)}</h2>
-     <span class="pill st-${s.status}">${STATUS_CN[s.status]||s.status}</span></div>
-    <div class="meta">批次 ${esc(s.batch_code)} · 第 ${s.round} 轮</div>`;
+     <span class="pill st-${s.status}">${STATUS_CN[s.status]||s.status}</span>
+     ${s.adjudication_required?'<span class="badge">须重裁</span>':''}</div>
+    <div class="meta">批次 ${esc(s.batch_code)} · 第 ${s.round} 轮${s.my_slot?(" · 你是读片"+(s.my_slot==="a"?"A":"B")):""}</div>`;
   if(published){
     R.innerHTML=head+`<div class="okmsg" style="font-size:14px">已发布 · 真实身份揭晓：<b>${esc(s.identity)}</b></div>`
       +readingBlock("读片 A",s.reading_a,s.reading_a&&s.reading_a.reader)
       +readingBlock("读片 B",s.reading_b,s.reading_b&&s.reading_b.reader)
-      +(s.adjudication?readingBlock("第三人裁决",s.adjudication,s.adjudication.adjudicator):"")
+      +(s.adjudication&&!s.adjudication.pending?readingBlock("第三人裁决",s.adjudication,s.adjudication.adjudicator):"")
       +histButton(s.blind_code);
     bindHist(s.blind_code); return;
   }
-  // 未发布：身份始终隐藏
-  head += `<div class="veil">🔒 盲评中：样本真实身份已隐藏${d.role==="reader"?"；在双方都提交前，你也看不到对方的任何信息。":"；裁决结论公布前不揭晓身份。"}</div>`;
+  head+=`<div class="veil">🔒 盲评中：样本真实身份已隐藏${me.role==="reader"?"；双方都提交前你看不到对方的任何信息。":"；裁决公布前不揭晓身份。"}</div>`;
 
-  if(d.role==="adjudicator"){
-    R.innerHTML=head
-      + readingBlock("匿名读片 A",s.reading_a)
-      + readingBlock("匿名读片 B",s.reading_b)
-      + decisionForm(s,"adjudicate");
+  if(me.role==="adjudicator"){
+    R.innerHTML=head+readingBlock("匿名读片 A",s.reading_a)+readingBlock("匿名读片 B",s.reading_b)+decisionForm(s,"adjudicate");
     bindMineralForm(s,"adjudicate"); return;
   }
 
-  // 读片人
   if(s.reading_a && s.reading_b){
-    // 双方已交：盲态保护期结束，可见双方内容（身份仍隐藏）
-    const myReading = s.my_slot==="a" ? s.reading_a : s.reading_b;
-    R.innerHTML=head
-      + readingBlock("读片 A",s.reading_a)+ readingBlock("读片 B",s.reading_b)
-      +(s.adjudication && !s.adjudication.pending?readingBlock("第三人裁决",s.adjudication):
-        `<div class="meta">${s.status==="adjudicating"?"两人存在分歧，等待/进行第三人裁决。":"两人达成共识。"}</div>`)
-      +`<div class="meta" style="margin:8px 0">如发现本人读片有误，可在下方<b>更正</b>（你是读片${s.my_slot==="a"?"A":"B"}，当前 v${s.my_version}）；更正会使原共识/裁决失效并重新裁决，旧版将保留。</div>`
-      + decisionForm(s,"amend",myReading) + histButton(s.blind_code);
+    const myReading=s.my_slot==="a"?s.reading_a:s.reading_b;
+    R.innerHTML=head+readingBlock("读片 A",s.reading_a)+readingBlock("读片 B",s.reading_b)
+      +(s.adjudication&&!s.adjudication.pending?readingBlock("第三人裁决",s.adjudication):
+        `<div class="meta">${s.status==="adjudicating"?"存在分歧或读片已更正，等待/进行第三人裁决。":"两人达成共识。"}</div>`)
+      +`<div class="meta" style="margin:8px 0">可在下方<b>更正</b>本人读片（当前 v${s.my_version}）；更正会使原共识/裁决失效并强制重新裁决，旧版保留。</div>`
+      +decisionForm(s,"amend",myReading)+histButton(s.blind_code);
     bindMineralForm(s,"amend"); bindHist(s.blind_code);
   }else{
-    // 只可能看到自己那份
     const my=s.my_reading;
-    R.innerHTML=head
-      +(my?readingBlock("我的读片（已提交，可更正）",my):`<div class="meta">你尚未提交。提交前无法看到对方信息。</div>`)
-      + decisionForm(s, my?"amend":"submit", my);
-    bindMineralForm(s, my?"amend":"submit");
+    R.innerHTML=head+(my?readingBlock("我的读片（已提交，可更正）",my):`<div class="meta">你尚未提交。提交前无法看到对方信息。</div>`)
+      +decisionForm(s,my?"amend":"submit",my);
+    bindMineralForm(s,my?"amend":"submit");
   }
 }
 
-/* ---------- 动态矿物表单 ---------- */
-function decisionForm(s, mode, pref){
-  const title = mode==="adjudicate"?"第三人裁决（以本结论作为最终鉴定）":(mode==="amend"?"更正我的读片（旧版留存，原共识/裁决失效）":"提交我的读片");
-  const mins = (pref&&pref.minerals||[{mineral:"",percent:null},{mineral:"",percent:null}]);
-  const rows = mins.map(m=>mineralRow(m.mineral,m.percent)).join("");
+/* ---------- 矿物表单 ---------- */
+function decisionForm(s,mode,pref){
+  const title=mode==="adjudicate"?"第三人裁决（以本结论作为最终鉴定）":(mode==="amend"?"更正我的读片（旧版留存，原共识/裁决失效并须重裁）":"提交我的读片");
+  const mins=(pref&&pref.minerals||[{mineral:"",percent:null},{mineral:"",percent:null}]);
   return `<div class="reading" style="background:#fff"><h4>${title}</h4>
     <label>岩性</label><input data-f="lithology" value="${pref?esc(pref.lithology):""}" placeholder="如 花岗闪长岩">
-    <label>矿物比例（%，合计必须正好 100）</label>
-    <div id="minRows">${rows}</div>
+    <label>矿物比例（%，合计必须正好 100；须为有限数值）</label>
+    <div id="minRows">${mins.map(m=>mineralRow(m.mineral,m.percent)).join("")}</div>
     <button type="button" class="ghost" id="addMin">+ 添加矿物</button>
     <div class="sum" id="sumLine"></div>
     <label>鉴定依据</label><textarea data-f="rationale" placeholder="结构、构造、镜下特征等">${pref?esc(pref.rationale):""}</textarea>
-    <div data-formmsg="" style="margin-top:8px"></div>
+    <div data-formmsg style="margin-top:8px"></div>
     <div style="margin-top:8px"><button id="submitDecision">${mode==="adjudicate"?"提交裁决":(mode==="amend"?"提交更正":"提交读片")}</button></div>
   </div>`;
 }
@@ -378,21 +405,22 @@ function mineralRow(name,pct){
     <input data-m="pct" type="number" step="0.01" min="0" placeholder="%" value="${pct??""}">
     <button type="button" class="ghost" data-del>×</button></div>`;
 }
-function bindMineralForm(s, mode){
+function bindMineralForm(s,mode){
   const box=$("#minRows"); if(!box) return;
-  const sumLine=$("#sumLine");
+  const sumLine=$("#sumLine"), btn=$("#submitDecision");
   const recalc=()=>{
     let total=0; box.querySelectorAll('[data-m="pct"]').forEach(i=>total+=parseFloat(i.value)||0);
     const ok=Math.abs(total-100)<0.01;
     sumLine.textContent="合计："+(Math.round(total*100)/100)+"%　"+(ok?"✔ 满足 100%":"✘ 必须为 100%");
     sumLine.className="sum "+(ok?"ok":"bad");
-    $("#submitDecision").disabled=!ok;
+    btn.disabled=!ok;
   };
   box.addEventListener("click",e=>{ if(e.target.dataset.del!=null){ e.target.closest(".minrow").remove(); recalc(); }});
   box.addEventListener("input",recalc);
   $("#addMin").onclick=()=>{ box.insertAdjacentHTML("beforeend",mineralRow("","")); recalc(); };
   recalc();
-  $("#submitDecision").onclick=async()=>{
+  btn.onclick=async()=>{
+    if(btn.disabled) return;
     const minerals=[...box.querySelectorAll(".minrow")].map(r=>({
       mineral:r.querySelector('[data-m="name"]').value.trim(),
       percent:parseFloat(r.querySelector('[data-m="pct"]').value)
@@ -401,25 +429,25 @@ function bindMineralForm(s, mode){
     const rationale=$('[data-f="rationale"]').value.trim();
     const msg=document.querySelector('[data-formmsg]');
     if(!lithology||!rationale){ msg.innerHTML=errHtml("岩性与依据不能为空"); return; }
-    if(minerals.some(m=>!(m.percent>=0))){ msg.innerHTML=errHtml("矿物比例必须为非负数字"); return; }
+    if(minerals.some(m=>!(m.percent>=0))){ msg.innerHTML=errHtml("矿物比例必须是有限、非负数字"); return; }
     if(Math.abs(minerals.reduce((a,b)=>a+b.percent,0)-100)>0.01){ msg.innerHTML=errHtml("比例合计必须为 100%"); return; }
+    btn.disabled=true;
     try{
       if(mode==="adjudicate"){
         await api("POST",`/api/samples/${encodeURIComponent(s.blind_code)}/adjudication`,
           {idempotency_key:uuid(),adjudicator:me.name,lithology,minerals,rationale});
-        state.detail=null; state.tab="work";
-        await refresh(); render();
+        state.detail=null; await refresh(); render();
       }else{
         const payload={idempotency_key:uuid(),reader:me.name,lithology,minerals,rationale};
         if(mode==="amend"){ payload.action="amend"; payload.expected_version=s.my_version; }
         await api("POST",`/api/samples/${encodeURIComponent(s.blind_code)}/readings`,payload);
         await reloadCurrentSample(s.blind_code);
       }
-    }catch(e){ document.querySelector('[data-formmsg]').innerHTML=errHtml(e.message); }
+    }catch(e){ msg.innerHTML=errHtml(e.message); btn.disabled=false; }
   };
 }
 async function reloadCurrentSample(code){
-  try{ state.detail={kind:"sample",code,data:await api("GET","/api/samples/"+encodeURIComponent(code)),role:"reader"}; }
+  try{ state.detail={kind:"sample",code,data:await api("GET","/api/samples/"+encodeURIComponent(code))}; }
   catch(e){ state.detail={kind:"error",message:e.message}; }
   render();
 }
@@ -437,13 +465,13 @@ function bindHist(code){
 function historyHtml(h){
   const rs=(h.readings||[]).map(r=>`<tr>
       <td>${r.slot==="a"?"读片A":"读片B"}${r.reader?(" / "+esc(r.reader)):""}</td>
-      <td>v${r.version} · 第${r.round}轮</td>
-      <td>${esc(r.lithology)}</td>
+      <td>v${r.version} · 第${r.round}轮</td><td>${esc(r.lithology)}</td>
       <td>${r.minerals.map(m=>esc(m.mineral)+" "+m.percent+"%").join("，")}</td>
       <td>${r.superseded?'<span class="tag-old">已作废(旧版留存)</span>':'<span class="tag-new">当前</span>'}</td></tr>`).join("");
   const as=(h.adjudications||[]).map(a=>`<tr>
       <td>${a.adjudicator?esc(a.adjudicator):"第三人"}${a.pending?"（待提交）":""}</td>
-      <td>第${a.round}轮</td><td>${a.pending?"—":esc(a.lithology)}</td><td>${a.pending?"—":a.minerals.map(m=>esc(m.mineral)+" "+m.percent+"%").join("，")}</td>
+      <td>第${a.round}轮</td><td>${a.pending?"—":esc(a.lithology)}</td>
+      <td>${a.pending?"—":a.minerals.map(m=>esc(m.mineral)+" "+m.percent+"%").join("，")}</td>
       <td>${a.superseded?'<span class="tag-old">因更正失效</span>':'<span class="tag-new">当前</span>'}</td></tr>`).join("");
   return `<div class="hist"><table>
       <tr><th>归属</th><th>版本/轮次</th><th>岩性</th><th>矿物比例</th><th>状态</th></tr>${rs}${as||""}</table></div>`;
@@ -451,15 +479,20 @@ function historyHtml(h){
 function errHtml(m){return `<div class="err">⚠ ${esc(m)}</div>`;}
 function okHtml(m){return `<div class="okmsg">✔ ${esc(m)}</div>`;}
 
-/* ------------------------------------------------------------- 刷新 */
 async function refresh(){
-  if(!me.name) return;
-  try{
-    if(me.role==="reader") await refreshReaderList();
-    else if(me.role==="adjudicator") await refreshAdjList();
-    else renderBatchChips();
-  }catch(e){ /* 明细区展示 */ }
+  if(!me) return;
+  if(me.role==="reader") await refreshReaderList();
+  else if(me.role==="adjudicator") await refreshAdjList();
+  else renderBatchChips();
 }
+
+/* ------------------------------------------------------------- 启动：恢复会话 */
+(function init(){
+  const saved = sessionStorage.getItem("blind_auth");
+  if(saved){ try{ me=JSON.parse(saved); }catch(e){ me=null; } }
+  renderLoginBox();
+  if(me) boot();
+})();
 </script>
 </body>
 </html>
