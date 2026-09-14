@@ -436,20 +436,31 @@ function bindMineralForm(s,mode){
       if(mode==="adjudicate"){
         await api("POST",`/api/samples/${encodeURIComponent(s.blind_code)}/adjudication`,
           {idempotency_key:uuid(),adjudicator:me.name,lithology,minerals,rationale});
-        state.detail=null; await refresh(); render();
+        // 裁决后：该样应移出待裁列表，并清空右侧明细，避免展示过期待裁表单
+        state.detail=null;
+        await syncAfterMutation();
       }else{
         const payload={idempotency_key:uuid(),reader:me.name,lithology,minerals,rationale};
         if(mode==="amend"){ payload.action="amend"; payload.expected_version=s.my_version; }
         await api("POST",`/api/samples/${encodeURIComponent(s.blind_code)}/readings`,payload);
-        await reloadCurrentSample(s.blind_code);
+        // 提交/更正后：同时刷新左侧任务列表与右侧详情（保留当前样为选中态）
+        await syncAfterMutation(s.blind_code);
       }
     }catch(e){ msg.innerHTML=errHtml(e.message); btn.disabled=false; }
   };
 }
-async function reloadCurrentSample(code){
-  try{ state.detail={kind:"sample",code,data:await api("GET","/api/samples/"+encodeURIComponent(code))}; }
-  catch(e){ state.detail={kind:"error",message:e.message}; }
-  render();
+/* 变更后同步：先按角色刷新左侧列表数据，再按需重载右侧详情，最后整体重渲染。
+   不依赖浏览器刷新；左侧卡片的“已提交 vN/可更正”状态即时更新。 */
+async function syncAfterMutation(selectedCode){
+  if(selectedCode){
+    try{ state.detail={kind:"sample",code:selectedCode,data:await api("GET","/api/samples/"+encodeURIComponent(selectedCode))}; }
+    catch(e){ state.detail={kind:"error",message:e.message}; }
+  }
+  render();  // 先重建左右两栏外壳与右侧详情
+  // 再拉取并填充左侧任务列表（卡片状态即时更新，无需刷新页面）
+  if(me.role==="reader") await refreshReaderList();
+  else if(me.role==="adjudicator") await refreshAdjList();
+  else await renderBatchChips();
 }
 
 /* ---------- 版本留痕 ---------- */

@@ -358,13 +358,16 @@ def sample_view(conn, s, role, name):
         if own is not None:
             view["my_version"] = own["version"]
 
-    # 关键盲态：读片人只有“本人已提交”后才允许看到双方内容；否则只看到自己那份。
+    # 关键盲态：读片人只有在“双方都已提交”后才允许看到成对内容；
+    # 本人已交而对方未交时，只保留本人记录（可更正），绝不暴露对方是否已写/写了什么。
     own_submitted = False
     if role == "reader" and my_slot is not None:
         own = ra if my_slot == "a" else rb
         own_submitted = own is not None
+    pair_complete = ra is not None and rb is not None
     # 被指派的裁决人可查看双方（裁决所需），但身份仍隐藏
-    can_see_pair = (role == "reader" and own_submitted) or (role == "adjudicator" and is_assigned_adj)
+    can_see_pair = (role == "reader" and own_submitted and pair_complete) \
+        or (role == "adjudicator" and is_assigned_adj)
 
     if can_see_pair:
         view["reading_a"] = reading_public(ra) if ra else None

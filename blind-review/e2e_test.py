@@ -361,6 +361,60 @@ def main():
         j1 = next(x for x in wl["samples"] if x["blind_code"] == w1)
         check("更正后：my_version=2", j1.get("my_version") == 2, str(j1.get("my_version")))
 
+        # -------------------------------- 8B. 本人先交/对方未交 → 详情与列表契约
+        section("8B · 本人先提交（对方未交）：保留本人记录、可更正、不见对方、列表不空")
+        st, ub = encode(host, ["U-A", "U-B"], idem="enc-ui-state")
+        u1 = f"{ub['batch_code']}-S001"
+        read(zhang, u1, "砂岩", mins(石英=70, 长石=30), idem="u-a1")
+
+        st, wl = zhang.get("/api/me/worklist")
+        codes = [x["blind_code"] for x in wl["samples"]]
+        check("提交后任务仍在本人列表（列表不空/不消失）", u1 in codes, str(codes))
+        item = next(x for x in wl["samples"] if x["blind_code"] == u1)
+        check("列表项带 my_version=1、my_slot=a",
+              item.get("my_version") == 1 and item.get("my_slot") == "a", str((item.get('my_version'), item.get('my_slot'))))
+        check("列表项不泄露对方结论/身份",
+              "reading_b" not in item and "reading_a" not in item and "identity" not in item,
+              str(sorted(item.keys())))
+
+        st, v = zhang.get(f"/api/samples/{u1}")
+        check("详情保留本人记录 my_reading（前端据此显示已提交/可更正，而非尚未提交）",
+              v.get("my_reading") is not None and v["my_reading"]["version"] == 1, str(sorted(v.keys())))
+        check("详情不成对暴露：无 reading_a/reading_b", "reading_a" not in v and "reading_b" not in v, "")
+        check("详情仍不见对方与身份", "reader_b" not in v and "identity" not in v, str(sorted(v.keys())))
+
+        # 本人此时更正（对方仍未交）
+        st, b = read(zhang, u1, "砂岩", mins(石英=69, 长石=31), idem="u-a2", action="amend", ev=1)
+        check("对方未交即可更正 -> reading、v2、标记须重裁",
+              b["sample_status"] == "reading" and b["version"] == 2, str(b))
+        st, v = zhang.get(f"/api/samples/{u1}")
+        check("更正后详情保留本人 v2", v.get("my_reading", {}).get("version") == 2, str(v.get("my_reading")))
+        st, wl = zhang.get("/api/me/worklist")
+        item = next(x for x in wl["samples"] if x["blind_code"] == u1)
+        check("更正后列表 my_version=2（即时一致，不靠刷新）", item.get("my_version") == 2, str(item.get("my_version")))
+
+        # 对方随后齐交
+        st, b = read(li, u1, "砂岩", mins(石英=69, 长石=31), idem="u-b1")
+        check("齐交后（更正轮）强制 adjudicating", b["sample_status"] == "adjudicating", str(b))
+        st, v = zhang.get(f"/api/samples/{u1}")
+        check("齐交后本人可见成对结论", v.get("reading_a") is not None and v.get("reading_b") is not None, "")
+        check("齐交后仍不见真实身份（未发布）", "identity" not in v, "")
+
+        # 对方（晚交者）首交后立即看自己的视图：应同时见双方（齐交），且其列表含该样
+        st, lv = li.get(f"/api/samples/{u1}")
+        check("晚交者齐交后见成对结论", lv.get("reading_a") is not None and lv.get("reading_b") is not None, "")
+        st, wl = li.get("/api/me/worklist")
+        check("晚交者列表含该样且 my_version=1",
+              any(x["blind_code"] == u1 and x.get("my_version") == 1 for x in wl["samples"]), "")
+
+        # 重新登录（不重启）后，任务列表与本人提交状态仍一致
+        zhang_relog = Client(base, "张工"); zhang_relog.login()
+        st, wl = zhang_relog.get("/api/me/worklist")
+        item = next((x for x in wl["samples"] if x["blind_code"] == u1), None)
+        check("重新登录后任务仍在列表且 my_version=2（不靠页面缓存）",
+              item is not None and item.get("my_version") == 2 and item["status"] == "adjudicating",
+              str(item and {k: item.get(k) for k in ("blind_code", "my_version", "status")}))
+
         # ------------------------------------------------ 9. 正常全流程
         section("9 · 正常全流程（共识 / 矿物分歧 / 岩性分歧 / 第三人 / 发布揭晓）")
         st, fb = encode(host, ["F-1", "F-2", "F-3"], idem="enc-full")
@@ -396,6 +450,13 @@ def main():
                            {"idempotency_key": "ad-f3", "adjudicator": "钱裁", "lithology": "石英二长岩",
                             "minerals": mins(石英=52, 长石=48), "rationale": "见钾长石"})
         check("两份分歧均裁决完成", b["sample_status"] == "adjudicated" and b2["sample_status"] == "adjudicated", f"{b} {b2}")
+        # 裁决提交后应即时移出各自待裁列表（不靠刷新）
+        st, awl = zhao.get("/api/me/worklist")
+        check("赵裁提交后 f2 移出待裁列表", f2 not in [x["blind_code"] for x in awl["samples"]],
+              str([x["blind_code"] for x in awl["samples"]]))
+        st, awl = qian.get("/api/me/worklist")
+        check("钱裁提交后 f3 移出待裁列表", f3 not in [x["blind_code"] for x in awl["samples"]],
+              str([x["blind_code"] for x in awl["samples"]]))
         st, b = host.post(f"/api/batches/{fc}/publish", {"idempotency_key": "pub-full", "host": host.name})
         check("整批发布 3 个", st == 200 and b["published"] == 3, f"{st} {b}")
         st, v = zhang.get(f"/api/samples/{f2}")
